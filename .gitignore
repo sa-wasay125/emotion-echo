@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# ============================================
+# EmotionEcho ML - Model weights & artifacts
+# ============================================
+
+# Large model files (too big for GitHub)
+ml/models/**/best_model.pth
+ml/models/**/final_model.pth
+ml/models/**/*.pth
+
+# Training artifacts
+ml/models/**/training_history.json
+ml/experiments/
+ml/evaluation/
+ml/training/models/
+
+# Datasets (if not already deleted)
+ml/datasets/
+
+# ML temporary files
+ml/temp_uploads/
+ml/*.zip
