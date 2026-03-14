@@ -1,0 +1,288 @@
+"""
+Training script for Simple Audio Model (No Transformers)
+Faster, GPU-optimized, no compatibility issues
+Run from ml/: python training/train_audio_simple.py
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
+import json
+from sklearn.model_selection import train_test_split
+import sys
+import os
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from preprocessing.audio_preprocess import AudioPreprocessor, parse_ravdess_filename
+from models.audio_model.audio_model_simple import SimpleAudioEmotionModel
+
+class AudioEmotionDataset(Dataset):
+    def __init__(self, audio_paths, labels, preprocessor):
+        self.audio_paths = audio_paths
+        self.labels = labels
+        self.preprocessor = preprocessor
+    
+    def __len__(self):
+        return len(self.audio_paths)
+    
+    def __getitem__(self, idx):
+        audio_path = self.audio_paths[idx]
+        label = self.labels[idx]
+        
+        try:
+            waveform = self.preprocessor.preprocess_audio(audio_path, augment=False)
+            if waveform.dim() == 2:
+                waveform = waveform.squeeze(0)
+        except Exception as e:
+            print(f"Error loading {audio_path}: {e}")
+            waveform = torch.zeros(16000 * 3)
+        
+        return waveform, label
+
+
+def load_ravdess_dataset(data_dir):
+    emotion_map = {
+        'neutral': 0, 'calm': 1, 'happy': 2, 'sad': 3,
+        'angry': 4, 'fearful': 5, 'disgust': 6, 'surprised': 7
+    }
+    
+    data_path = Path(data_dir) / 'Audio_Speech_Actors_01-24'
+    if not data_path.exists():
+        raise FileNotFoundError(f"RAVDESS directory not found: {data_path}")
+    
+    audio_paths, labels, actors = [], [], []
+    
+    for actor_dir in data_path.glob('Actor_*'):
+        for audio_file in actor_dir.glob('*.wav'):
+            metadata = parse_ravdess_filename(audio_file.name)
+            emotion = metadata['emotion']
+            
+            if emotion in emotion_map:
+                audio_paths.append(str(audio_file))
+                labels.append(emotion_map[emotion])
+                actors.append(metadata['actor'])
+    
+    return audio_paths, labels, actors
+
+
+def train_epoch(model, dataloader, criterion, optimizer, scaler, device, epoch):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
+    for waveforms, labels in pbar:
+        waveforms = waveforms.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        if scaler is not None:
+            with autocast():
+                outputs = model(waveforms)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(waveforms)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        
+        running_loss += loss.item()
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+        
+        pbar.set_postfix({
+            'loss': f"{running_loss / (pbar.n + 1):.4f}",
+            'acc': f"{100 * correct / total:.2f}%"
+        })
+    
+    return running_loss / len(dataloader), 100 * correct / total
+
+
+def validate(model, dataloader, criterion, device, epoch):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Val]  ")
+        for waveforms, labels in pbar:
+            waveforms = waveforms.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            outputs = model(waveforms)
+            loss = criterion(outputs, labels)
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            pbar.set_postfix({
+                'loss': f"{running_loss / (pbar.n + 1):.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            })
+    
+    return running_loss / len(dataloader), 100 * correct / total
+
+
+def main():
+    print("\n" + "="*60)
+    print("🎙️ SIMPLE AUDIO EMOTION MODEL TRAINING (GPU)")
+    print("="*60 + "\n")
+    
+    config = {
+        'data_dir': 'datasets/audio/ravdess',
+        'batch_size': 8,  # CPU optimized  # Can use larger batch with simple model
+        'num_epochs': 50,
+        'learning_rate': 1e-3,
+        'weight_decay': 1e-4,
+        'device': 'cpu',  # Force CPU
+        'save_dir': 'models/audio_model',
+        'num_workers': 4,
+        'target_sr': 16000,
+        'duration': 3.0,
+        'pin_memory': True,
+        'use_amp': False  # Disabled for CPU
+    }
+    
+    if not torch.cuda.is_available():
+        print("⚠️ WARNING: CUDA not available! Training on CPU will be slow.")
+        config['device'] = 'cpu'
+        config['pin_memory'] = False
+        config['use_amp'] = False
+    else:
+        print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"✓ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    print(f"\nConfiguration:")
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    
+    Path(config['save_dir']).mkdir(parents=True, exist_ok=True)
+    
+    print("\nInitializing preprocessor...")
+    preprocessor = AudioPreprocessor(
+        target_sr=config['target_sr'],
+        duration=config['duration']
+    )
+    
+    print("\nLoading RAVDESS dataset...")
+    audio_paths, labels, actors = load_ravdess_dataset(config['data_dir'])
+    print(f"✓ Total files: {len(audio_paths)}")
+    
+    if len(audio_paths) == 0:
+        print("❌ No data found! Check datasets/audio/ravdess/Audio_Speech_Actors_01-24/")
+        return
+    
+    from collections import Counter
+    emotion_names = ['neutral', 'calm', 'happy', 'sad', 'angry', 'fearful', 'disgust', 'surprised']
+    counts = Counter(labels)
+    print("\nSamples per emotion:")
+    for i, name in enumerate(emotion_names):
+        print(f"  {name:<12}: {counts[i]:>4}")
+    
+    print("\nSplitting dataset...")
+    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+        audio_paths, labels, test_size=0.3, random_state=42, stratify=labels
+    )
+    val_paths, test_paths, val_labels, test_labels = train_test_split(
+        temp_paths, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
+    )
+    
+    print(f"✓ Train: {len(train_paths)} | Val: {len(val_paths)} | Test: {len(test_paths)}")
+    
+    train_dataset = AudioEmotionDataset(train_paths, train_labels, preprocessor)
+    val_dataset = AudioEmotionDataset(val_paths, val_labels, preprocessor)
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=config['batch_size'], shuffle=True,
+        num_workers=config['num_workers'], pin_memory=config['pin_memory']
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config['batch_size'], shuffle=False,
+        num_workers=config['num_workers'], pin_memory=config['pin_memory']
+    )
+    
+    print(f"\nInitializing model on {config['device']}...")
+    model = SimpleAudioEmotionModel(num_classes=8)
+    model = model.to(config['device'])
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"✓ Parameters: {total_params:,} (~{total_params * 4 / 1e6:.0f} MB)")
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    scaler = GradScaler() if config['use_amp'] else None
+    
+    print(f"\n{'='*60}")
+    print("STARTING TRAINING")
+    print(f"{'='*60}\n")
+    
+    best_val_acc = 0.0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    start_time = time.time()
+    
+    for epoch in range(1, config['num_epochs'] + 1):
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch}/{config['num_epochs']}")
+        print(f"{'='*60}")
+        
+        epoch_start = time.time()
+        
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scaler, config['device'], epoch)
+        val_loss, val_acc = validate(model, val_loader, criterion, config['device'], epoch)
+        scheduler.step(val_acc)
+        
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        epoch_time = time.time() - epoch_start
+        
+        print(f"\nResults:")
+        print(f"  Train → Loss: {train_loss:.4f} | Acc: {train_acc:.2f}%")
+        print(f"  Val   → Loss: {val_loss:.4f} | Acc: {val_acc:.2f}%")
+        print(f"  Time: {epoch_time:.1f}s")
+        
+        if config['device'] == 'cuda':
+            print(f"  GPU Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            model.save_model(str(Path(config['save_dir']) / 'best_model.pth'))
+            print(f"  ✓ Saved best model ({val_acc:.2f}%)")
+    
+    total_time = time.time() - start_time
+    
+    model.save_model(str(Path(config['save_dir']) / 'final_model.pth'))
+    
+    with open(Path(config['save_dir']) / 'training_history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    print(f"\n{'='*60}")
+    print("✅ TRAINING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Best val accuracy: {best_val_acc:.2f}%")
+    print(f"Total time: {total_time/60:.1f} min ({total_time/3600:.2f} hrs)")
+    print(f"Avg per epoch: {total_time/config['num_epochs']:.1f}s")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    main()
